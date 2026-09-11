@@ -1,0 +1,353 @@
+name: Deploy to Production
+
+on:
+  # NOTE: 'published' fires exactly once per release publish. Do NOT add
+  # 'released' — both fire on the same event and produce TWO gate runs
+  # (concurrency queues the second, causing a duplicate prod deploy + npm
+  # publish ~35 min later). Use workflow_dispatch to re-trigger after a
+  # failed/cancelled run instead.
+  release:
+    types: [published]
+  workflow_dispatch:
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  staging-gate:
+    name: Staging E2E Gate
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run unit tests with coverage
+        run: npm run test:ci
+
+      - name: Install Firebase CLI
+        run: npm install -g firebase-tools
+
+      - name: Enable required APIs and grant roles on test project (best-effort)
+        continue-on-error: true
+        env:
+          E2E_SA_KEY: ${{ secrets.E2E_SA_KEY }}
+        run: |
+          printf '%s' "$E2E_SA_KEY" > /tmp/e2e-sa.json
+          gcloud auth activate-service-account --key-file=/tmp/e2e-sa.json
+          PROJECT="${{ vars.E2E_GCP_PROJECT_ID || 'agentbase-test-staging' }}"
+          for proj in "$PROJECT" agentbase-test-production; do
+            echo "=== Enabling APIs on $proj ==="
+            gcloud services enable serviceusage.googleapis.com --project "$proj" 2>/dev/null || true
+            gcloud services enable firestore.googleapis.com --project "$proj" 2>/dev/null || true
+            gcloud services enable firebasestorage.googleapis.com --project "$proj" 2>/dev/null || true
+            gcloud services enable firebase.googleapis.com --project "$proj" 2>/dev/null || true
+            gcloud services enable firebasehosting.googleapis.com --project "$proj" 2>/dev/null || true
+            gcloud services enable identitytoolkit.googleapis.com --project "$proj" 2>/dev/null || true
+            gcloud services enable iam.googleapis.com --project "$proj" 2>/dev/null || true
+            gcloud services enable cloudbilling.googleapis.com --project "$proj" 2>/dev/null || true
+            gcloud services enable compute.googleapis.com --project "$proj" 2>/dev/null || true
+            gcloud services enable cloudresourcemanager.googleapis.com --project "$proj" 2>/dev/null || true
+            gcloud services enable secretmanager.googleapis.com --project "$proj" 2>/dev/null || true
+          done
+          # Grant WIF pool admin to both deploy SA and e2e-runner SA
+          # NOTE: the deploy SA lives in the agentbase-staging project
+          # (vars.GCP_SA_STAGING) — deriving it as firebase-deploy-staging@${PROJECT}
+          # would target a phantom SA the OIDC step never uses (see PR #55).
+          DEPLOY_SA="${{ vars.GCP_SA_STAGING }}"
+          E2E_SA="e2e-test-runner@${PROJECT}.iam.gserviceaccount.com"
+          for sa in "$DEPLOY_SA" "$E2E_SA"; do
+            # cloudresourcemanager.projectViewer: lets the wizard's getProjectNumber()
+            # resolve the default compute SA (projectNumber-compute@...), which is
+            # the identity the e2e VM runs as and MUST be granted SM secretAccessor
+            # at write time or the VM can never fetch github-pat/discord-bot-token.
+            for role in roles/iam.workloadIdentityPoolAdmin roles/iam.securityAdmin roles/serviceusage.serviceUsageAdmin roles/iam.serviceAccountUser roles/iam.serviceAccountTokenCreator roles/billing.projectManager roles/secretmanager.admin roles/cloudresourcemanager.projectViewer; do
+              gcloud projects add-iam-policy-binding "$PROJECT" \
+                --member="serviceAccount:${sa}" \
+                --role="${role}" 2>/dev/null || true
+            done
+          done
+          gcloud auth revoke --all 2>/dev/null || true
+          rm /tmp/e2e-sa.json
+
+      - name: Use default hosting site for staging
+        run: jq 'del(.hosting.site)' firebase.json > firebase.tmp.json && mv firebase.tmp.json firebase.json
+
+      - name: Authenticate to GCP (OIDC)
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SA_STAGING }}
+
+      - name: Grant deploy SA runtime roles (SM writes + VM creation)
+        # The CLI e2e runs as the deploy SA (ADC/WIF) and slice 4 (map #36)
+        # writes SM secrets during init; Step 7 also attaches the agent SA to
+        # the VM, which requires iam.serviceAccountUser on the SA (without it
+        # GCE rejects the create with SERVICE_ACCOUNT_ACCESS_DENIED). The
+        # deploy SA holds projectIamAdmin on the test project, so it can bind
+        # these roles to itself; the earlier best-effort loop (e2e SA) is not
+        # a reliable source of the grants (mirrors PR #51/#55 in the staging
+        # workflow — this gate must not drift from it).
+        run: |
+          gcloud projects add-iam-policy-binding agentbase-test-staging \
+            --member="serviceAccount:${{ vars.GCP_SA_STAGING }}" \
+            --role="roles/secretmanager.admin"
+          gcloud projects add-iam-policy-binding agentbase-test-staging \
+            --member="serviceAccount:${{ vars.GCP_SA_STAGING }}" \
+            --role="roles/iam.serviceAccountUser"
+
+      - name: Build (staging)
+        run: npm run build
+        env:
+          VITE_APP_ENV: staging
+          VITE_FIREBASE_API_KEY_STAGING: ${{ vars.FIREBASE_API_KEY_STAGING }}
+          VITE_FIREBASE_AUTH_DOMAIN_STAGING: ${{ vars.FIREBASE_AUTH_DOMAIN_STAGING }}
+          VITE_FIREBASE_PROJECT_ID_STAGING: ${{ vars.FIREBASE_PROJECT_ID_STAGING }}
+          VITE_FIREBASE_STORAGE_BUCKET_STAGING: ${{ vars.FIREBASE_STORAGE_BUCKET_STAGING }}
+          VITE_FIREBASE_MESSAGING_SENDER_ID_STAGING: ${{ vars.FIREBASE_MESSAGING_SENDER_ID_STAGING }}
+          VITE_FIREBASE_APP_ID_STAGING: ${{ vars.FIREBASE_APP_ID_STAGING }}
+          VITE_FIREBASE_MEASUREMENT_ID_STAGING: ${{ vars.FIREBASE_MEASUREMENT_ID_STAGING }}
+          VITE_FIREBASE_APP_CHECK_SITE_KEY_STAGING: ${{ vars.FIREBASE_APP_CHECK_SITE_KEY_STAGING }}
+          VITE_GCP_CLIENT_ID: ${{ vars.GCP_CLIENT_ID_STAGING }}
+          VITE_APP_VERSION: ${{ github.ref_name }}
+          VITE_APP_MODE: ${{ vars.VITE_APP_MODE }}
+          VITE_APP_NAME: ${{ vars.VITE_APP_NAME }}
+          VITE_E2E: 'true'
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Deploy to Firebase Staging
+        run: npx firebase-tools deploy --only hosting,firestore --project ${{ vars.FIREBASE_PROJECT_ID_STAGING }}
+
+      - name: Wait for Staging Deploy
+        run: |
+          URL="https://${{ vars.FIREBASE_PROJECT_ID_STAGING }}.web.app"
+          echo "Waiting for $URL to be reachable..."
+          for i in $(seq 1 30); do
+            if curl -sf -o /dev/null "$URL" 2>/dev/null; then
+              echo "Site is up!"
+              exit 0
+            fi
+            echo "Waiting... attempt $i"
+            sleep 5
+          done
+          echo "Site did not become reachable within 150 seconds"
+          exit 1
+
+      - name: Enable Firebase Auth and create test user
+        env:
+          E2E_TEST_PASSWORD: ${{ secrets.E2E_TEST_PASSWORD }}
+        run: |
+          TOKEN=$(gcloud auth print-access-token 2>/dev/null)
+          if [ -n "$TOKEN" ]; then echo "::add-mask::$TOKEN"; fi
+          PROJECT=${{ vars.FIREBASE_PROJECT_ID_STAGING }}
+          EMAIL="e2e@${PROJECT}.iam.gserviceaccount.com"
+          PASSWORD="$E2E_TEST_PASSWORD"
+
+          echo "=== Enabling email/password auth for ${PROJECT} ==="
+          curl -s -X PATCH \
+            "https://identitytoolkit.googleapis.com/v2/projects/${PROJECT}/config?updateMask=signIn.email.enabled,signIn.email.passwordRequired" \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d '{"signIn":{"email":{"enabled":true,"passwordRequired":true}}}'
+
+          echo "=== Creating test user via public signUp API ==="
+          RESP=$(curl -s -X POST \
+            "https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=${{ vars.FIREBASE_API_KEY_STAGING }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"email\":\"${EMAIL}\",\"password\":\"${PASSWORD}\",\"returnSecureToken\":true}")
+          USER_ID=$(echo "$RESP" | jq -r '.localId // empty')
+          echo "Test user UID: ${USER_ID:-unknown}"
+
+          echo "=== Creating infra_configs document for test user ==="
+          if [ -n "$USER_ID" ] && [ "$USER_ID" != "null" ]; then
+            curl -s -X PATCH \
+              "https://firestore.googleapis.com/v1/projects/${PROJECT}/databases/(default)/documents/infra_configs/${USER_ID}" \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"fields\":{\"e2eTest\":{\"booleanValue\":true},\"createdAt\":{\"timestampValue\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}}}"
+            echo "infra_configs created for test user"
+          else
+            echo "WARNING: Could not get test user ID, infra_configs not created"
+          fi
+
+      - name: Run Smoke Tests on Staging
+        run: npx playwright test e2e/smoke.spec.js --retries=2
+        env:
+          TEST_URL: https://${{ vars.FIREBASE_PROJECT_ID_STAGING }}.web.app
+          E2E_TEST_EMAIL: e2e@${{ vars.FIREBASE_PROJECT_ID_STAGING }}.iam.gserviceaccount.com
+          E2E_TEST_PASSWORD: ${{ secrets.E2E_TEST_PASSWORD }}
+          E2E_FIREBASE_API_KEY: ${{ vars.FIREBASE_API_KEY_STAGING }}
+
+      - name: Generate e2e GCP token via impersonation
+        id: gen-e2e-token
+        run: |
+          if [ -n "${{ vars.E2E_GCP_PROJECT_ID }}" ]; then
+            TOKEN=$(gcloud auth print-access-token \
+              --impersonate-service-account="e2e-test-runner@${{ vars.E2E_GCP_PROJECT_ID }}.iam.gserviceaccount.com" 2>/dev/null || \
+              gcloud auth print-access-token 2>/dev/null || echo "")
+            if [ -n "$TOKEN" ]; then
+              echo "::add-mask::$TOKEN"
+            fi
+            echo "token=$TOKEN" >> $GITHUB_OUTPUT
+          else
+            echo "token=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run Full E2E Tests on Staging
+        run: npx playwright test --retries=2
+        env:
+          TEST_URL: https://${{ vars.FIREBASE_PROJECT_ID_STAGING }}.web.app
+          E2E_GCP_TOKEN: ${{ steps.gen-e2e-token.outputs.token }}
+          E2E_GCP_PROJECT_ID: ${{ vars.E2E_GCP_PROJECT_ID }}
+          E2E_FULL: 'true'
+          E2E_FIREBASE_API_KEY: ${{ vars.FIREBASE_API_KEY_STAGING }}
+          E2E_TEST_EMAIL: e2e@agentbase-staging.iam.gserviceaccount.com
+          E2E_TEST_PASSWORD: ${{ secrets.E2E_TEST_PASSWORD }}
+          E2E_SA_KEY: ${{ secrets.E2E_SA_KEY }}
+          E2E_GITHUB_PAT: ${{ secrets.E2E_GITHUB_PAT }}
+          E2E_DISCORD_TOKEN: ${{ secrets.E2E_DISCORD_BOT_TOKEN }}
+          E2E_DISCORD_BOT_ADDED: 'true'
+          E2E_APP_MODE: 'true'
+          E2E_PROJECT_NAME: 'agentbase-testing'
+          E2E_GITHUB_OWNER: 'kallhoffa'
+          E2E_FIREBASE_STAGING_PROJECT_ID: ${{ vars.FIREBASE_PROJECT_ID_STAGING }}
+          E2E_FIREBASE_PRODUCTION_PROJECT_ID: ${{ vars.FIREBASE_PROJECT_ID_PRODUCTION }}
+
+      - name: Build CLI
+        run: |
+          cd cli && npm ci && npm run build && npm pack
+          ls -la *.tgz
+
+      - name: Run CLI E2E Tests
+        run: |
+          CLI_PKG=$(ls cli/secureagentbase-*.tgz)
+          echo "CLI package: $CLI_PKG"
+          CLI_PACKAGE="$CLI_PKG" node tests/e2e/cli.spec.mjs
+        env:
+          GCP_PROJECT_ID: ${{ vars.E2E_GCP_PROJECT_ID }}
+          E2E_GITHUB_PAT: ${{ secrets.E2E_GITHUB_PAT }}
+          E2E_GITHUB_OWNER: 'kallhoffa'
+          E2E_GITHUB_REPO: 'agentbase-testing'
+          E2E_DISCORD_TOKEN: ${{ secrets.E2E_DISCORD_BOT_TOKEN }}
+          E2E_FULL: 'true'
+
+  production-promote:
+    name: Deploy to Production
+    needs: staging-gate
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Firebase CLI
+        run: npm install -g firebase-tools
+
+      - name: Authenticate to GCP (OIDC)
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SA_PRODUCTION }}
+
+      - name: Build (production)
+        run: npm run build
+        env:
+          VITE_APP_ENV: production
+          VITE_FIREBASE_API_KEY_PRODUCTION: ${{ vars.FIREBASE_API_KEY_PRODUCTION }}
+          VITE_FIREBASE_AUTH_DOMAIN_PRODUCTION: ${{ vars.FIREBASE_AUTH_DOMAIN_PRODUCTION }}
+          VITE_FIREBASE_PROJECT_ID_PRODUCTION: ${{ vars.FIREBASE_PROJECT_ID_PRODUCTION }}
+          VITE_FIREBASE_STORAGE_BUCKET_PRODUCTION: ${{ vars.FIREBASE_STORAGE_BUCKET_PRODUCTION }}
+          VITE_FIREBASE_MESSAGING_SENDER_ID_PRODUCTION: ${{ vars.FIREBASE_MESSAGING_SENDER_ID_PRODUCTION }}
+          VITE_FIREBASE_APP_ID_PRODUCTION: ${{ vars.FIREBASE_APP_ID_PRODUCTION }}
+          VITE_FIREBASE_MEASUREMENT_ID_PRODUCTION: ${{ vars.FIREBASE_MEASUREMENT_ID_PRODUCTION }}
+          VITE_FIREBASE_APP_CHECK_SITE_KEY_PRODUCTION: ${{ vars.FIREBASE_APP_CHECK_SITE_KEY_PRODUCTION }}
+          VITE_GCP_CLIENT_ID: ${{ vars.GCP_CLIENT_ID_PRODUCTION }}
+          VITE_APP_VERSION: ${{ github.ref_name }}
+          VITE_APP_MODE: ${{ vars.VITE_APP_MODE }}
+          VITE_APP_NAME: ${{ vars.VITE_APP_NAME }}
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Deploy to Firebase
+        run: npx firebase-tools deploy --only hosting,firestore --project ${{ vars.FIREBASE_PROJECT_ID_PRODUCTION }}
+
+      - name: Wait for Production Deploy
+        run: |
+          URL="https://${{ vars.PRODUCTION_URL }}"
+          echo "Waiting for $URL to be reachable..."
+          for i in $(seq 1 30); do
+            if curl -sf -o /dev/null "$URL" 2>/dev/null; then
+              echo "Site is up!"
+              exit 0
+            fi
+            echo "Waiting... attempt $i"
+            sleep 5
+          done
+          echo "Site did not become reachable within 150 seconds"
+          exit 1
+
+      - name: Run Smoke Tests on Production
+        run: npx playwright test e2e/smoke.spec.js --retries=2
+        env:
+          TEST_URL: https://${{ vars.PRODUCTION_URL }}
+
+      - name: Upload logs on failure
+        if: failure()
+        run: |
+          echo "## Deployment Failed" >> $GITHUB_STEP_SUMMARY
+          echo "Check the logs above for errors." >> $GITHUB_STEP_SUMMARY
+
+  publish-npm:
+    name: Publish CLI to npm
+    needs: production-promote
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Node.js (v6 required for npm Trusted Publishing / OIDC)
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
+
+      - name: Install latest npm (OIDC requires npm CLI 11.5.1+)
+        run: npm install -g npm@latest
+
+      - name: Install CLI dependencies
+        run: cd cli && npm ci
+
+      - name: Set CLI version from git tag (prevents version drift)
+        run: cd cli && npm version ${{ github.ref_name }} --no-git-tag-version --allow-same-version
+
+      - name: Publish to npm (Trusted Publishing via OIDC, no token)
+        run: cd cli && npm publish --provenance
