@@ -1,0 +1,84 @@
+name: CI
+
+# CI gate — runs the full check (unit tests + lint + typecheck + build) on every
+# PR to main and every push to main. This is the source of truth for "is this
+# change safe to merge / deploy" — local runs are optional fast feedback only.
+#
+# Forks inherit this workflow automatically because it lives in .github/workflows/
+# in the repo. No per-fork setup required.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: unit tests
+            cmd: npx vitest run --pool=forks --coverage
+          - name: lint
+            cmd: npm run lint
+          - name: typecheck
+            cmd: npm run typecheck
+          - name: build
+            cmd: npm run build
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      # Force npm 11 — Node 22 ships npm 10.x which has a flat-mode hoisting
+      # bug (only ~175 of ~530 packages install on this lockfile). AGENTS.md
+      # documents the workaround: a known-good npm must install the deps.
+      - name: Upgrade npm
+        run: npm install -g npm@latest
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: ${{ matrix.name }}
+        run: ${{ matrix.cmd }}
+
+  cli-build:
+    name: CLI builds (tsc)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: cli/package-lock.json
+
+      - name: Upgrade npm
+        run: npm install -g npm@latest
+
+      - name: Install CLI dependencies
+        run: cd cli && npm ci
+
+      - name: Build CLI
+        run: cd cli && npm run build
