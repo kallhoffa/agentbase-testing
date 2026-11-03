@@ -1,0 +1,13 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "opencode-go/glm-5.3",
+  "provider": {
+    "opencode-go": {
+      "options": {
+        "timeout": 300000,
+        "headerTimeout": 120000,
+        "chunkTimeout": 120000
+      }
+    }
+  }
+}

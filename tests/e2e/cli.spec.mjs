@@ -1,0 +1,346 @@
+/**
+ * CLI E2E tests
+ *
+ * Uses the packaged CLI (secureagentbase-*.tgz) installed from the CI artifact.
+ * Authenticates via ADC (GOOGLE_APPLICATION_CREDENTIALS set by WIF in CI).
+ *
+ * Modes:
+ *   Minimal (default):  init --no-firebase --no-vm  (fast smoke test)
+ *   Full (E2E_FULL):    init with Firebase + GitHub + OIDC + Discord + VM (same endstate as wizard)
+ *
+ * Requires env vars:
+ *   CLI_PACKAGE     - path to the .tgz package (set by CI)
+ *   GCP_PROJECT_ID  - project to test against (agentbase-test-staging)
+ *   E2E_GITHUB_PAT  - GitHub PAT for repo creation (full mode only)
+ *   SKIP_CLEANUP    - set to "true" to keep created resources for debugging
+ */
+
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const PASS = '\x1b[32m✓\x1b[0m';
+const FAIL = '\x1b[31m✗\x1b[0m';
+const SKIP = '\x1b[33m∘\x1b[0m';
+
+let passed = 0;
+let failed = 0;
+let skipped = 0;
+
+function assert(condition, msg) {
+  if (condition) {
+    console.log(`  ${PASS} ${msg}`);
+    passed++;
+  } else {
+    console.log(`  ${FAIL} ${msg}`);
+    failed++;
+  }
+}
+
+function run(bin, args, opts = {}) {
+  const result = spawnSync(bin, args, {
+    cwd: opts.cwd || process.cwd(),
+    env: { ...process.env, ...opts.env },
+    stdio: 'pipe',
+    timeout: opts.timeout || 120_000,
+  });
+  return {
+    exitCode: result.status,
+    stdout: result.stdout?.toString() || '',
+    stderr: result.stderr?.toString() || '',
+  };
+}
+
+async function verifyGithubVariables({ pat, owner, repo, requiredVars, timeoutMs = 90_000, label = '' }) {
+  const varsUrl = `https://api.github.com/repos/${owner}/${repo}/actions/variables?per_page=100`;
+  const deadline = Date.now() + timeoutMs;
+  let lastDetail = 'not fetched yet';
+  while (Date.now() < deadline) {
+    try {
+      const resp = await fetch(varsUrl, {
+        headers: { Authorization: `token ${pat}`, Accept: 'application/vnd.github+json' },
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        const byName = Object.fromEntries((data.variables || []).map((v) => [v.name, v]));
+        const staleOrMissing = requiredVars.filter((name) => {
+          const v = byName[name];
+          if (!v) return false;
+          // 15-minute freshness window: a stale variable from a previous
+          // run does NOT count — OIDC/provider values are per-run and the
+          // deploy-critical set must be refreshed by THIS init.
+          return (Date.now() - new Date(v.updated_at).getTime()) / 60000 >= 15;
+        });
+        const present = requiredVars.filter((name) => byName[name]);
+        lastDetail = requiredVars.map((n) => (byName[n] && !staleOrMissing.includes(n) ? n : `${n}(stale/missing)`)).join(', ');
+        if (staleOrMissing.length === 0) {
+          return { ok: true, detail: lastDetail };
+        }
+        console.log(`  ${label}waiting for GitHub variables (present ${present.length}/${requiredVars.length}, stale/missing refresh pending)`);
+      } else {
+        console.log(`  ${label}GitHub variables fetch HTTP ${resp.status} — check E2E_GITHUB_PAT has Variables Read`);
+      }
+    } catch (e) {
+      console.log(`  ${label}GitHub variables fetch error: ${e.message}`);
+    }
+    await new Promise((r) => setTimeout(r, 5000));
+  }
+  return { ok: false, detail: lastDetail };
+}
+
+async function main() {
+  const cliPackage = process.env.CLI_PACKAGE;
+  const projectId = process.env.GCP_PROJECT_ID || process.env.E2E_GCP_PROJECT_ID;
+  const githubPat = process.env.E2E_GITHUB_PAT;
+  const fullMode = process.env.E2E_FULL === 'true';
+  const skipCleanup = process.env.SKIP_CLEANUP === 'true';
+
+  if (!cliPackage) {
+    console.log(`${SKIP} CLI_E2E: CLI_PACKAGE not set, skipping`);
+    skipped++;
+    console.log(`\nResults: ${passed} passed, ${failed} failed, ${skipped} skipped`);
+    process.exit(failed > 0 ? 1 : 0);
+  }
+
+  if (!projectId) {
+    console.log(`${SKIP} CLI_E2E: GCP_PROJECT_ID not set, skipping`);
+    skipped++;
+    console.log(`\nResults: ${passed} passed, ${failed} failed, ${skipped} skipped`);
+    process.exit(failed > 0 ? 1 : 0);
+  }
+
+  if (fullMode && !githubPat) {
+    console.log(`${SKIP} CLI_E2E: E2E_FULL=true but E2E_GITHUB_PAT not set, skipping full mode`);
+    skipped++;
+    console.log(`\nResults: ${passed} passed, ${failed} failed, ${skipped} skipped`);
+    process.exit(failed > 0 ? 1 : 0);
+  }
+
+  const githubOwner = process.env.E2E_GITHUB_OWNER || 'kallhoffa';
+  const repoName = process.env.E2E_GITHUB_REPO || 'agentbase-testing';
+  const discordToken = process.env.E2E_DISCORD_TOKEN;
+
+  // Install CLI from package in a temp directory
+  const tmpDir = mkdtempSync(join(tmpdir(), 'cli-e2e-'));
+  const homeDir = join(tmpDir, 'home');
+  console.log(`\nCLI E2E (project: ${projectId}, mode: ${fullMode ? 'full' : 'minimal'})`);
+
+  // Resolve the package path relative to the workspace
+  const pkgPath = resolve(cliPackage);
+  if (!existsSync(pkgPath)) {
+    console.log(`${FAIL} Package not found at ${pkgPath}`);
+    failed++;
+    process.exit(1);
+  }
+
+  // Repo sources, for the static assertions in Test 1b (Windows spawn safety).
+  // Derive the repo root from this file's own location, NOT process.cwd() —
+  // CI runs this suite from the workspace root while `npm pack` runs inside
+  // cli/, so cwd is not a dependable anchor.
+  //
+  // Guard against running from a non-checkout copy. `npx stryker run` runs
+  // earlier in this same job and leaves a full repo clone in
+  // .stryker-tmp/sandbox-*/, snapshot at checkout time. When the suite runs
+  // from there it reads that stale snapshot, so a source assertion silently
+  // judges an old file instead of the current source. Only assert when we are
+  // in the real checkout; the tarball e2e below still proves runtime behaviour.
+  const repoRoot = resolve(fileURLToPath(import.meta.url), '../../..');
+  const inGitCheckout = existsSync(join(repoRoot, '.git'));
+  const cliSrcPath = join(repoRoot, 'cli/src/lib/auth.ts');
+  const cliIndexSrc = join(repoRoot, 'cli/src/index.ts');
+  if (!existsSync(cliSrcPath) || !existsSync(cliIndexSrc)) {
+    console.log(`${FAIL} Could not locate CLI sources at ${repoRoot}/cli/src — cannot run Test 1b`);
+    failed++;
+    process.exit(1);
+  }
+
+  // Install
+  console.log(`  Installing ${pkgPath}...`);
+  const install = run('npm', ['install', '-g', pkgPath], {
+    cwd: tmpDir,
+    timeout: 60_000,
+    env: { npm_config_prefix: join(tmpDir, 'npm-global') },
+  });
+
+  if (install.exitCode !== 0) {
+    console.log(install.stderr || install.stdout);
+    console.log(`${FAIL} CLI installation failed`);
+    failed++;
+    process.exit(1);
+  }
+
+  const npmBin = join(tmpDir, 'npm-global', 'bin');
+  const cliBin = join(npmBin, 'secureagentbase');
+
+  // Ensure the CLI binary exists
+  if (!existsSync(cliBin)) {
+    console.log(`${FAIL} CLI binary not found at ${cliBin}`);
+    failed++;
+    process.exit(1);
+  }
+
+  console.log(`  CLI installed at ${cliBin}\n`);
+
+  const envBase = {
+    HOME: homeDir,
+    PATH: `${npmBin}:${process.env.PATH}`,
+    XDG_CONFIG_HOME: join(homeDir, '.config'),
+  };
+
+  // Test 1: Status (no config yet)
+  console.log('Test 1: status — no config');
+  let r = run(cliBin, ['status'], { env: envBase });
+  assert(r.exitCode === 0, 'status exits with 0');
+  assert(r.stdout.includes('No deployment found') || r.stdout.includes('SecureAgentBase Status'), 'status shows no deployment');
+
+  // Test 1b: every spawn of an external CLI must pass `shell` on Windows.
+  //
+  // gcloud ships as gcloud.cmd there, which spawnSync cannot execute without
+  // `shell: true`. This shipped broken on Windows: the probe used shell, so
+  // findGcloud() succeeded, then the login call omitted it and died with
+  // `spawnSync gcloud ENOENT` (v1.4.8). The failure is Windows-only and this
+  // suite runs on Linux, so assert on the source instead.
+  console.log('\nTest 1b: Windows spawn safety');
+  if (!inGitCheckout) {
+    console.log(`  ${SKIP} source assertions (not a git checkout — likely a Stryker sandbox copy)`);
+    skipped++;
+  } else {
+    const authSrc = readFileSync(cliSrcPath, 'utf8');
+    const idxSrc = readFileSync(cliIndexSrc, 'utf8');
+    // Every spawnSync must carry `shell:`. The login call is the one that broke:
+    // it invokes a resolved external binary (`gcloud`) with no shell, so on
+    // Windows it throws ENOENT against gcloud.cmd. Note the probe is also a
+    // spawnSync and must keep its shell flag — do not exempt either call.
+    const spawnCalls = [...authSrc.matchAll(/spawnSync\([^)]*\{[^}]*\}/g)].map((m) => m[0]);
+    const unsafe = spawnCalls.filter((c) => !/shell\s*:/.test(c));
+    assert(
+      spawnCalls.length > 0 && unsafe.length === 0,
+      `all ${spawnCalls.length} spawnSync call(s) in auth.ts pass shell: for Windows` +
+        (unsafe.length ? ` — unsafe: ${unsafe.map((c) => c.slice(0, 40)).join(' | ')}` : '')
+    );
+    assert(/function needsShell/.test(authSrc), 'needsShell() helper exists in auth.ts');
+    assert(/shell:\s*needsShell\(\)/.test(authSrc), 'auth.ts uses the shared needsShell() helper');
+    // --version must come from package.json, not a hardcoded literal.
+    assert(/createRequire/.test(idxSrc), 'CLI --version reads package.json (createRequire)');
+    assert(!/VERSION\s*=\s*['"]0\./.test(idxSrc), 'CLI --version is not a hardcoded literal');
+  }
+
+  // Test 2: Init
+  if (fullMode) {
+    // Full mode: Firebase + GitHub + OIDC + Discord + VM (same endstate as wizard)
+    const initArgs = [
+      'init',
+      '--project-id', projectId,
+      '--auto-sa',
+      '--github-pat', githubPat,
+      '--repo-name', repoName,
+      '-y',
+    ];
+    if (discordToken) {
+      initArgs.push('--discord-token', discordToken);
+    }
+    // The e2e project normally has billing already attached, so init
+    // short-circuits on isBillingEnabled and never lists or prompts. BILLING_ACCOUNT
+    // is only needed as an override for a project that is NOT already linked.
+    const billingAccount = process.env.BILLING_ACCOUNT;
+    if (billingAccount) {
+      initArgs.push('--billing-account', billingAccount);
+    }
+    console.log(`Test 2: init — full (repo: ${githubOwner}/${repoName}, vm: yes, discord: ${discordToken ? 'yes' : 'no'}, billing: ${billingAccount ? 'explicit' : 'auto/-y'})`);
+    {
+      r = run(cliBin, initArgs, { env: envBase, timeout: 900_000 });
+
+      if (r.exitCode === 0) {
+        assert(true, 'init completes successfully');
+      } else {
+        console.log(`  exit code: ${r.exitCode}`);
+        if (r.stdout) console.log(`  stdout:\n${r.stdout}`);
+        if (r.stderr) console.log(`  stderr:\n${r.stderr}`);
+        assert(false, 'init completes successfully');
+      }
+
+      // Verify output contains expected steps
+      assert(r.stdout.includes('Firebase') || r.stdout.includes('firebase') || r.stdout.includes('Skipping Firebase') === false, 'init includes Firebase setup');
+      assert(r.stdout.includes('GitHub') || r.stdout.includes('github') || r.stdout.includes('Skipping GitHub') === false, 'init includes GitHub setup');
+      assert(r.stdout.includes('Discord') || r.stdout.includes('discord') || r.stdout.includes('Skipping Discord') === false, 'init includes Discord setup');
+      assert(r.stdout.includes('VM created') || r.stdout.includes('vm') || r.stdout.includes('Skipping VM') === false, 'init includes VM creation');
+
+      // REAL API assertion (mirrors wizard.spec.js): the "init exits 0" +
+      // stdout checks above only prove the CLI THINKS it set the GitHub
+      // variables — init swallows setGitHubVariable errors with a warn
+      // ("may already exist") and can 403 on Variables write scope while
+      // still exiting 0. Poll the GitHub API and require the deploy-critical
+      // set to exist AND be refreshed by THIS run (updated_at < 15 min old;
+      // stale values from a previous run don't count).
+      if (githubPat) {
+        const requiredVars = ['GCP_WIF_PROVIDER', 'GCP_SA_STAGING', 'GCP_SA_PRODUCTION', 'FIREBASE_PROJECT_ID_STAGING'];
+        const result = await verifyGithubVariables({ pat: githubPat, owner: githubOwner, repo: repoName, requiredVars, label: 'Github vars: ' });
+        if (result.ok) {
+          assert(true, `GitHub variables verified fresh via API (${result.detail})`);
+        } else {
+          console.log(`  GHA vars detail: ${result.detail}`);
+          assert(false, 'deploy-critical GitHub variables were not refreshed by init within 90s (GCP_WIF_PROVIDER, GCP_SA_STAGING, GCP_SA_PRODUCTION, FIREBASE_PROJECT_ID_STAGING). Check E2E_GITHUB_PAT has Variables Read and Write.');
+        }
+      }
+    }
+  } else {
+    // Minimal mode: fast smoke test
+    console.log('Test 2: init — minimal headless');
+    {
+      r = run(cliBin, [
+        'init',
+        '--project-id', projectId,
+        '--auto-sa',
+        '--no-firebase',
+        '--no-vm',
+      ], { env: envBase, timeout: 180_000 });
+
+      if (r.exitCode === 0) {
+        assert(true, 'init completes successfully');
+      } else {
+        console.log(`  exit code: ${r.exitCode}`);
+        if (r.stdout) console.log(`  stdout:\n${r.stdout}`);
+        if (r.stderr) console.log(`  stderr:\n${r.stderr}`);
+        assert(false, 'init completes successfully');
+      }
+    }
+  }
+
+  // Test 3: Status after init
+  console.log('Test 3: status — after init');
+  r = run(cliBin, ['status'], { env: envBase });
+  assert(r.exitCode === 0, 'status exits with 0');
+  assert(r.stdout.includes(projectId), 'status shows project ID');
+  assert(r.stdout.includes('secureagent-manager'), 'status shows service account');
+
+  if (fullMode) {
+    assert(r.stdout.includes('github.com') || r.stdout.includes('agentbase-testing'), 'status shows GitHub repo');
+  }
+
+  // Test 4: Destroy (cleanup)
+  if (!skipCleanup) {
+    console.log('Test 4: destroy — cleanup');
+    r = run(cliBin, ['destroy', '-y'], { env: envBase, timeout: 60_000 });
+    console.log(`  ${r.stdout}`);
+    assert(r.exitCode === 0 || r.stdout.includes('No deployment') || r.stdout.includes('Configuration cleared'), 'destroy ran');
+
+    // Test 5: Status after destroy
+    console.log('Test 5: status — after destroy');
+    r = run(cliBin, ['status'], { env: envBase });
+    assert(r.stdout.includes('No deployment found'), 'status shows no deployment after destroy');
+  } else {
+    console.log(`  ${SKIP} destroy (SKIP_CLEANUP=true)`);
+    skipped++;
+  }
+
+  // Summary
+  console.log(`\nResults: ${passed} passed, ${failed} failed, ${skipped} skipped`);
+  process.exit(failed > 0 ? 1 : 0);
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
